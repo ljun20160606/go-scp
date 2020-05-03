@@ -38,7 +38,7 @@ func (s *SCP) SendFile(srcFile, destFile string) error {
 		if err != nil {
 			return fmt.Errorf("failed to stat source file: err=%s", err)
 		}
-		fi := newFileInfoFromOS(osFileInfo, "")
+		fi := NewFileInfoFromOS(osFileInfo, "")
 
 		file, err := os.Open(srcFile)
 		if err != nil {
@@ -122,7 +122,7 @@ func (s *SCP) SendDir(srcDir, destDir string, acceptFn AcceptFunc) error {
 				return err
 			}
 
-			scpFileInfo := newFileInfoFromOS(info, "")
+			scpFileInfo := NewFileInfoFromOS(info, "")
 			accepted, err := acceptFn(filepath.Dir(path), scpFileInfo)
 			if err != nil {
 				return err
@@ -139,7 +139,7 @@ func (s *SCP) SendDir(srcDir, destDir string, acceptFn AcceptFunc) error {
 				}
 			} else {
 				if accepted {
-					fi := newFileInfoFromOS(info, "")
+					fi := NewFileInfoFromOS(info, "")
 					file, err := os.Open(path)
 					if err != nil {
 						return err

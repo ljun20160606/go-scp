@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func newFileInfoFromOS(fi os.FileInfo, replaceName string) *FileInfo {
+func NewFileInfoFromOS(fi os.FileInfo, replaceName string) *FileInfo {
 	var name string
 	if replaceName == "" {
 		name = fi.Name()
