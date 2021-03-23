@@ -1,6 +1,7 @@
 package scp
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -17,7 +18,7 @@ import (
 func (s *SCP) Receive(srcFile string, dest io.Writer) (os.FileInfo, error) {
 	var info os.FileInfo
 	srcFile = realPath(filepath.Clean(srcFile))
-	err := runResourceSession(s.client, srcFile, false, "", false, true, func(s *resourceSession) error {
+	err := runResourceSession(s.ctx, s.client, srcFile, false, "", false, true, func(s *resourceSession) error {
 		var timeHeader timeMsgHeader
 		h, err := s.ReadHeaderOrReply()
 		if err != nil {
@@ -61,7 +62,7 @@ func (s *SCP) ReceiveFile(srcFile, destFile string) error {
 		destFile = filepath.Join(destFile, filepath.Base(srcFile))
 	}
 
-	return runResourceSession(s.client, srcFile, false, "", false, true, func(s *resourceSession) error {
+	return runResourceSession(s.ctx, s.client, srcFile, false, "", false, true, func(s *resourceSession) error {
 		h, err := s.ReadHeaderOrReply()
 		if err != nil {
 			return fmt.Errorf("failed to read scp message header: err=%s", err)
@@ -131,7 +132,7 @@ func (s *SCP) ReceiveDir(srcDir, destDir string, acceptFn AcceptFunc) error {
 		acceptFn = acceptAny
 	}
 
-	return runResourceSession(s.client, srcDir, false, "", true, true, func(s *resourceSession) error {
+	return runResourceSession(s.ctx, s.client, srcDir, false, "", true, true, func(s *resourceSession) error {
 		curDir := destDir
 		var timeHeader timeMsgHeader
 		var timeHeaders []timeMsgHeader
@@ -328,12 +329,23 @@ func (s *resourceSession) Wait() error {
 	return s.session.Wait()
 }
 
-func runResourceSession(client *ssh.Client, remoteSrcPath string, remoteSrcIsDir bool, scpPath string, recursive, updatesPermission bool, handler func(s *resourceSession) error) error {
+func runResourceSession(ctx context.Context, client *ssh.Client, remoteSrcPath string, remoteSrcIsDir bool, scpPath string, recursive, updatesPermission bool, handler func(s *resourceSession) error) error {
 	s, err := newResourceSession(client, remoteSrcPath, remoteSrcIsDir, scpPath, recursive, updatesPermission)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
+	go func() {
+		done := ctx.Done()
+		// can never canceled
+		if done == nil {
+			return
+		}
+		select {
+		case <-done:
+			s.Close()
+		}
+	}()
 
 	if err := handler(s); err != nil {
 		return err
