@@ -3,6 +3,7 @@ package scp
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,179 +11,256 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Send reads a single local file content from the r,
-// and copies it to the remote file with the name destFile.
-// The time and permission will be set with the value of info.
-// The r will be closed after copying. If you don't want for r to be
-// closed, you can pass the result of ioutil.NopCloser(r).
-func (s *SCP) Send(info *FileInfo, r io.ReadCloser, destFile string) error {
+// Receive copies a single remote file to the specified writer
+// and returns the file information. The actual type of the file information is
+// scp.FileInfo, and you can get the access time with fileInfo.(*scp.FileInfo).AccessTime().
+func (s *SCP) Receive(srcFile string, dest io.Writer) (os.FileInfo, error) {
+	var info os.FileInfo
+	srcFile = realPath(filepath.Clean(srcFile))
+	err := runResourceSession(s.client, srcFile, false, "", false, true, func(s *resourceSession) error {
+		var timeHeader timeMsgHeader
+		h, err := s.ReadHeaderOrReply()
+		if err != nil {
+			return fmt.Errorf("failed to read scp message header: err=%s", err)
+		}
+		var ok bool
+		timeHeader, ok = h.(timeMsgHeader)
+		if !ok {
+			return fmt.Errorf("expected time message header, got %+v", h)
+		}
+
+		h, err = s.ReadHeaderOrReply()
+		if err != nil {
+			return fmt.Errorf("failed to read scp message header: err=%s", err)
+		}
+		fileHeader, ok := h.(fileMsgHeader)
+		if !ok {
+			return fmt.Errorf("expected file message header, got %+v", h)
+		}
+		if err := s.CopyFileBodyTo(fileHeader, dest); err != nil {
+			return fmt.Errorf("failed to copy file: err=%s", err)
+		}
+
+		info = NewFileInfo(srcFile, fileHeader.Size, fileHeader.Mode, timeHeader.Mtime, timeHeader.Atime)
+		return nil
+	})
+	return info, err
+}
+
+// ReceiveFile copies a single remote file to the local machine with
+// the specified name. The time and permission will be set to the same value
+// of the source file.
+func (s *SCP) ReceiveFile(srcFile, destFile string) error {
+	srcFile = realPath(filepath.Clean(srcFile))
 	destFile = filepath.Clean(destFile)
-	destFile = realPath(filepath.Dir(destFile))
+	fiDest, err := os.Stat(destFile)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to get information of destnation file: err=%s", err)
+	}
+	if err == nil && fiDest.IsDir() {
+		destFile = filepath.Join(destFile, filepath.Base(srcFile))
+	}
 
-	return runSourceSession(s.client, destFile, false, "", false, true, func(s *sourceSession) error {
-		err := s.WriteFile(info, r)
+	return runResourceSession(s.client, srcFile, false, "", false, true, func(s *resourceSession) error {
+		h, err := s.ReadHeaderOrReply()
 		if err != nil {
-			return fmt.Errorf("failed to copy file: err=%s", err)
+			return fmt.Errorf("failed to read scp message header: err=%s", err)
 		}
-		return nil
+		timeHeader, ok := h.(timeMsgHeader)
+		if !ok {
+			return fmt.Errorf("expected time message header, got %+v", h)
+		}
+
+		h, err = s.ReadHeaderOrReply()
+		if err != nil {
+			return fmt.Errorf("failed to read scp message header: err=%s", err)
+		}
+		fileHeader, ok := h.(fileMsgHeader)
+		if !ok {
+			return fmt.Errorf("expected file message header, got %+v", h)
+		}
+
+		return copyFileBodyFromRemote(s, destFile, timeHeader, fileHeader)
 	})
 }
 
-// SendFile copies a single local file to the remote server.
-// The time and permission will be set with the value of the source file.
-func (s *SCP) SendFile(srcFile, destFile string) error {
-	srcFile = filepath.Clean(srcFile)
-	destFile = realPath(filepath.Clean(destFile))
+func copyFileBodyFromRemote(s *resourceSession, localFilename string, timeHeader timeMsgHeader, fileHeader fileMsgHeader) error {
+	file, err := os.OpenFile(localFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, fileHeader.Mode)
+	if err != nil {
+		return fmt.Errorf("failed to open destination file: err=%s", err)
+	}
 
-	return runSourceSession(s.client, destFile, false, "", false, true, func(s *sourceSession) error {
-		osFileInfo, err := os.Stat(srcFile)
-		if err != nil {
-			return fmt.Errorf("failed to stat source file: err=%s", err)
-		}
-		fi := newFileInfoFromOS(osFileInfo, "")
+	if err := s.CopyFileBodyTo(fileHeader, file); err != nil {
+		file.Close()
+		return fmt.Errorf("failed to copy file: err=%s", err)
+	}
+	file.Close()
 
-		file, err := os.Open(srcFile)
-		if err != nil {
-			return fmt.Errorf("failed to open source file: err=%s", err)
-		}
-		// NOTE: file will be closed by WriteFile.
-		err = s.WriteFile(fi, file)
-		if err != nil {
-			return fmt.Errorf("failed to copy file: err=%s", err)
-		}
-		return nil
-	})
+	if err := os.Chmod(localFilename, fileHeader.Mode); err != nil {
+		return fmt.Errorf("failed to change file mode: err=%s", err)
+	}
+
+	if err := os.Chtimes(localFilename, timeHeader.Atime, timeHeader.Mtime); err != nil {
+		return fmt.Errorf("failed to change file time: err=%s", err)
+	}
+
+	return nil
 }
 
-// AcceptFunc is the type of the function called for each file or directory
-// to determine whether is should be copied or not.
-// In SendDir, parentDir will be a directory under srcDir.
-// In ReceiveDir, parentDir will be a directory under destDir.
-type AcceptFunc func(parentDir string, info os.FileInfo) (bool, error)
+// ReceiveDir copies files and directories under a remote srcDir to
+// to the destDir on the local machine. You can filter the files and directories
+// to be copied with acceptFn. If acceptFn is nil, all files and directories will
+// be copied. The time and permission will be set to the same value of the source
+// file or directory.
+func (s *SCP) ReceiveDir(srcDir, destDir string, acceptFn AcceptFunc) error {
+	srcDir = realPath(filepath.Clean(srcDir))
+	destDir = filepath.Clean(destDir)
+	_, err := os.Stat(destDir)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to get information of destination directory: err=%s", err)
+	}
+	var skipsFirstDirectory bool
+	if os.IsNotExist(err) {
+		skipsFirstDirectory = true
+		if err := os.MkdirAll(destDir, 0777); err != nil {
+			return fmt.Errorf("failed to create destination directory: err=%s", err)
+		}
+	}
 
-func acceptAny(parentDir string, info os.FileInfo) (bool, error) {
-	return true, nil
-}
-
-// SendDir copies files and directories under the local srcDir to
-// to the remote destDir. You can filter the files and directories to be copied with acceptFn.
-// However this filtering is done at the receiver side, so all file bodies are transferred
-// over the network even if some files are filtered out. If you need more efficiency,
-// it is better to use another method like the tar command.
-// If acceptFn is nil, all files and directories will be copied.
-// The time and permission will be set to the same value of the source file or directory.
-func (s *SCP) SendDir(srcDir, destDir string, acceptFn AcceptFunc) error {
-	srcDir = filepath.Clean(srcDir)
-	destDir = realPath(filepath.Clean(destDir))
 	if acceptFn == nil {
 		acceptFn = acceptAny
 	}
 
-	return runSourceSession(s.client, destDir, false, "", true, true, func(s *sourceSession) error {
-		prevDirSkipped := false
-
-		endDirectories := func(prevDir, dir string) error {
-			rel, err := filepath.Rel(prevDir, dir)
-			if err != nil {
-				return err
+	return runResourceSession(s.client, srcDir, false, "", true, true, func(s *resourceSession) error {
+		curDir := destDir
+		var timeHeader timeMsgHeader
+		var timeHeaders []timeMsgHeader
+		isFirstStartDirectory := true
+		var skipBaseDir string
+		for {
+			h, err := s.ReadHeaderOrReply()
+			if err == io.EOF {
+				break
+			} else if err != nil {
+				return fmt.Errorf("failed to read scp message header: err=%s", err)
 			}
-			for _, comp := range strings.Split(rel, string([]rune{filepath.Separator})) {
-				if comp == ".." {
-					if prevDirSkipped {
-						prevDirSkipped = false
-					} else {
-						err := s.EndDirectory()
-						if err != nil {
-							return err
+			switch h.(type) {
+			case timeMsgHeader:
+				timeHeader = h.(timeMsgHeader)
+			case startDirectoryMsgHeader:
+				dirHeader := h.(startDirectoryMsgHeader)
+
+				if isFirstStartDirectory {
+					isFirstStartDirectory = false
+					if skipsFirstDirectory {
+						continue
+					}
+				}
+
+				curDir = filepath.Join(curDir, dirHeader.Name)
+				timeHeaders = append(timeHeaders, timeHeader)
+
+				if skipBaseDir != "" {
+					continue
+				}
+
+				info := NewFileInfo(dirHeader.Name, 0, dirHeader.Mode|os.ModeDir, timeHeader.Mtime, timeHeader.Atime)
+				accepted, err := acceptFn(filepath.Dir(curDir), info)
+				if err != nil {
+					return fmt.Errorf("error from accessFn: err=%s", err)
+				}
+				if !accepted {
+					skipBaseDir = curDir
+					continue
+				}
+
+				if err := os.MkdirAll(curDir, dirHeader.Mode); err != nil {
+					return fmt.Errorf("failed to create directory: err=%s", err)
+				}
+
+				if err := os.Chmod(curDir, dirHeader.Mode); err != nil {
+					return fmt.Errorf("failed to change directory mode: err=%s", err)
+				}
+			case endDirectoryMsgHeader:
+				if len(timeHeaders) > 0 {
+					timeHeader = timeHeaders[len(timeHeaders)-1]
+					timeHeaders = timeHeaders[:len(timeHeaders)-1]
+					if skipBaseDir == "" {
+						if err := os.Chtimes(curDir, timeHeader.Atime, timeHeader.Mtime); err != nil {
+							return fmt.Errorf("failed to change directory time: err=%s", err)
 						}
 					}
 				}
-			}
-			return nil
-		}
-
-		prevDir := srcDir
-		myWalkFn := func(path string, info os.FileInfo, err error) error {
-			// We must check err is not nil first.
-			// See https://golang.org/pkg/path/filepath/#WalkFunc
-			if err != nil {
-				return err
-			}
-
-			isDir := info.IsDir()
-			var dir string
-			if isDir {
-				dir = path
-			} else {
-				dir = filepath.Dir(path)
-			}
-			defer func() {
-				prevDir = dir
-			}()
-
-			err = endDirectories(prevDir, dir)
-			if err != nil {
-				return err
-			}
-
-			scpFileInfo := newFileInfoFromOS(info, "")
-			accepted, err := acceptFn(filepath.Dir(path), scpFileInfo)
-			if err != nil {
-				return err
-			}
-
-			if isDir {
-				if !accepted {
-					prevDirSkipped = true
-					return filepath.SkipDir
+				curDir = filepath.Dir(curDir)
+				if skipBaseDir != "" {
+					var sub bool
+					if curDir == "" {
+						sub = true
+					} else {
+						var err error
+						sub, err = isSubdirectory(skipBaseDir, curDir)
+						if err != nil {
+							return fmt.Errorf("failed to check directory is subdirectory: err=%s", err)
+						}
+					}
+					if !sub {
+						skipBaseDir = ""
+					}
 				}
-
-				err := s.StartDirectory(scpFileInfo)
-				if err != nil {
-					return err
-				}
-			} else {
-				if accepted {
-					fi := newFileInfoFromOS(info, "")
-					file, err := os.Open(path)
+			case fileMsgHeader:
+				fileHeader := h.(fileMsgHeader)
+				if skipBaseDir == "" {
+					info := NewFileInfo(fileHeader.Name, fileHeader.Size, fileHeader.Mode, timeHeader.Mtime, timeHeader.Atime)
+					accepted, err := acceptFn(curDir, info)
 					if err != nil {
+						return fmt.Errorf("error from accessFn: err=%s", err)
+					}
+					if !accepted {
+						continue
+					}
+					localFilename := filepath.Join(curDir, fileHeader.Name)
+					if err = copyFileBodyFromRemote(s, localFilename, timeHeader, fileHeader); err != nil {
 						return err
 					}
-					err = s.WriteFile(fi, file)
-					if err != nil {
+				} else {
+					if err := s.CopyFileBodyTo(fileHeader, ioutil.Discard); err != nil {
 						return err
 					}
 				}
+			case okMsg:
+				// do nothing
 			}
-			return nil
 		}
-		err := filepath.Walk(srcDir, myWalkFn)
-		if err != nil {
-			return err
-		}
-
-		return endDirectories(prevDir, srcDir)
+		return nil
 	})
 }
 
-type sourceSession struct {
+func isSubdirectory(basepath, targetpath string) (bool, error) {
+	rel, err := filepath.Rel(basepath, targetpath)
+	if err != nil {
+		return false, err
+	}
+	return !strings.HasPrefix(rel, ".."+string([]rune{filepath.Separator})), nil
+}
+
+type resourceSession struct {
 	client            *ssh.Client
 	session           *ssh.Session
-	remoteDestPath    string
-	remoteDestIsDir   bool
+	remoteSrcPath     string
+	remoteSrcIsDir    bool
 	scpPath           string
 	recursive         bool
 	updatesPermission bool
 	stdin             io.WriteCloser
 	stdout            io.Reader
-	*sourceProtocol
+	*resourceProtocol
 }
 
-func newSourceSession(client *ssh.Client, remoteDestPath string, remoteDestIsDir bool, scpPath string, recursive, updatesPermission bool) (*sourceSession, error) {
-	s := &sourceSession{
+func newResourceSession(client *ssh.Client, remoteSrcPath string, remoteSrcIsDir bool, scpPath string, recursive, updatesPermission bool) (*resourceSession, error) {
+	s := &resourceSession{
 		client:            client,
-		remoteDestPath:    remoteDestPath,
-		remoteDestIsDir:   remoteDestIsDir,
+		remoteSrcPath:     remoteSrcPath,
+		remoteSrcIsDir:    remoteSrcIsDir,
 		scpPath:           scpPath,
 		recursive:         recursive,
 		updatesPermission: updatesPermission,
@@ -191,78 +269,75 @@ func newSourceSession(client *ssh.Client, remoteDestPath string, remoteDestIsDir
 	var err error
 	s.session, err = s.client.NewSession()
 	if err != nil {
-		return s, err
+		_ = s.session.Close()
+		return nil, err
 	}
 
 	s.stdout, err = s.session.StdoutPipe()
 	if err != nil {
-		return s, err
+		_ = s.session.Close()
+		return nil, err
 	}
 
 	s.stdin, err = s.session.StdinPipe()
 	if err != nil {
-		return s, err
+		_ = s.session.Close()
+		return nil, err
 	}
 
 	if s.scpPath == "" {
 		s.scpPath = "scp"
 	}
 
-	opt := []byte("-t")
+	opt := []byte("-f")
 	if s.updatesPermission {
 		opt = append(opt, 'p')
 	}
 	if s.recursive {
 		opt = append(opt, 'r')
 	}
-	if s.remoteDestIsDir {
+	if s.remoteSrcIsDir {
 		opt = append(opt, 'd')
 	}
 
-	cmd := s.scpPath + " " + string(opt) + " " + escapeShellArg(s.remoteDestPath)
-	err = s.session.Start(cmd)
-	if err != nil {
-		return s, err
+	cmd := s.scpPath + " " + string(opt) + " " + escapeShellArg(s.remoteSrcPath)
+	if err := s.session.Start(cmd); err != nil {
+		_ = s.session.Close()
+		return nil, err
 	}
 
-	s.sourceProtocol, err = newSourceProtocol(s.stdin, s.stdout)
-	return s, err
+	s.resourceProtocol, err = newResourceProtocol(s.stdin, s.stdout)
+	if err != nil {
+		_ = s.session.Close()
+		return nil, err
+	}
+	return s, nil
 }
 
-func (s *sourceSession) Close() error {
+func (s *resourceSession) Close() error {
 	if s == nil || s.session == nil {
 		return nil
 	}
 	return s.session.Close()
 }
 
-func (s *sourceSession) Wait() error {
+func (s *resourceSession) Wait() error {
 	if s == nil || s.session == nil {
 		return nil
 	}
 	return s.session.Wait()
 }
 
-func (s *sourceSession) CloseStdin() error {
-	if s == nil || s.stdin == nil {
-		return nil
+func runResourceSession(client *ssh.Client, remoteSrcPath string, remoteSrcIsDir bool, scpPath string, recursive, updatesPermission bool, handler func(s *resourceSession) error) error {
+	s, err := newResourceSession(client, remoteSrcPath, remoteSrcIsDir, scpPath, recursive, updatesPermission)
+	if err != nil {
+		return err
 	}
-	return s.stdin.Close()
-}
-
-func runSourceSession(client *ssh.Client, remoteDestPath string, remoteDestIsDir bool, scpPath string, recursive, updatesPermission bool, handler func(s *sourceSession) error) error {
-	s, err := newSourceSession(client, remoteDestPath, remoteDestIsDir, scpPath, recursive, updatesPermission)
 	defer s.Close()
-	if err != nil {
-		return err
-	}
-	err = func() error {
-		defer s.CloseStdin()
 
-		return handler(s)
-	}()
-	if err != nil {
+	if err := handler(s); err != nil {
 		return err
 	}
+
 	return s.Wait()
 }
