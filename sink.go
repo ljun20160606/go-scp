@@ -1,6 +1,7 @@
 package scp
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -19,7 +20,7 @@ func (s *SCP) Send(info *FileInfo, r io.ReadCloser, destFile string) error {
 	destFile = filepath.Clean(destFile)
 	destFile = realPath(filepath.Dir(destFile))
 
-	return runSinkSession(s.client, destFile, false, "", false, true, func(s *sinkSession) error {
+	return runSinkSession(s.ctx, s.client, destFile, false, "", false, true, func(s *sinkSession) error {
 		if err := s.WriteFile(info, r); err != nil {
 			return fmt.Errorf("failed to copy file: err=%s", err)
 		}
@@ -33,7 +34,7 @@ func (s *SCP) SendFile(srcFile, destFile string) error {
 	srcFile = filepath.Clean(srcFile)
 	destFile = realPath(filepath.Clean(destFile))
 
-	return runSinkSession(s.client, destFile, false, "", false, true, func(s *sinkSession) error {
+	return runSinkSession(s.ctx, s.client, destFile, false, "", false, true, func(s *sinkSession) error {
 		osFileInfo, err := os.Stat(srcFile)
 		if err != nil {
 			return fmt.Errorf("failed to stat source file: err=%s", err)
@@ -76,7 +77,7 @@ func (s *SCP) SendDir(srcDir, destDir string, acceptFn AcceptFunc) error {
 		acceptFn = acceptAny
 	}
 
-	return runSinkSession(s.client, destDir, false, "", true, true, func(s *sinkSession) error {
+	return runSinkSession(s.ctx, s.client, destDir, false, "", true, true, func(s *sinkSession) error {
 		prevDirSkipped := false
 
 		endDirectories := func(prevDir, dir string) error {
@@ -249,12 +250,23 @@ func (s *sinkSession) CloseStdin() error {
 	return s.stdin.Close()
 }
 
-func runSinkSession(client *ssh.Client, remoteDestPath string, remoteDestIsDir bool, scpPath string, recursive, updatesPermission bool, handler func(s *sinkSession) error) error {
+func runSinkSession(ctx context.Context, client *ssh.Client, remoteDestPath string, remoteDestIsDir bool, scpPath string, recursive, updatesPermission bool, handler func(s *sinkSession) error) error {
 	s, err := newSinkSession(client, remoteDestPath, remoteDestIsDir, scpPath, recursive, updatesPermission)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
+	go func() {
+		done := ctx.Done()
+		// can never canceled
+		if done == nil {
+			return
+		}
+		select {
+		case <-done:
+			s.Close()
+		}
+	}()
 	if err := func() error {
 		defer s.CloseStdin()
 

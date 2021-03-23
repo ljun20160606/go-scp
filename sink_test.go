@@ -4,6 +4,7 @@ package scp
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +38,35 @@ func TestSendFile(t *testing.T) {
 		t.Fatalf("fail to serve test sshd server; %s", err)
 	}
 	defer c.Close()
+
+	t.Run("Cancel send file", func(t *testing.T) {
+		localDir, err := ioutil.TempDir("", "go-scp-TestSendFile-local")
+		if err != nil {
+			t.Fatalf("fail to get tempdir; %s", err)
+		}
+		defer os.RemoveAll(localDir)
+
+		remoteDir, err := ioutil.TempDir("", "go-scp-TestSendFile-remote")
+		if err != nil {
+			t.Fatalf("fail to get tempdir; %s", err)
+		}
+		defer os.RemoveAll(remoteDir)
+
+		localName := "test1.dat"
+		remoteName := "dest.dat"
+		localPath := filepath.Join(localDir, localName)
+		remotePath := filepath.Join(remoteDir, remoteName)
+		err = generateRandomFile(localPath)
+		if err != nil {
+			t.Fatalf("fail to generate local file; %s", err)
+		}
+
+		ctx, cancelFunc := context.WithCancel(context.Background())
+		cancelFunc()
+		if err := NewSCP(c, WithContext(ctx)).SendFile(localPath, remotePath); !strings.HasSuffix(err.Error(), "EOF") {
+			t.Errorf("fail to cancel; %s", err)
+		}
+	})
 
 	t.Run("Random sized file", func(t *testing.T) {
 		localDir, err := ioutil.TempDir("", "go-scp-TestSendFile-local")
