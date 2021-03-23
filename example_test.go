@@ -1,4 +1,4 @@
-package scp_test
+package scp
 
 import (
 	"crypto/rand"
@@ -12,8 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
-	scp "github.com/hnakamur/go-scp"
-	sshd "github.com/hnakamur/go-sshd"
+	"github.com/hnakamur/go-sshd"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -100,7 +99,7 @@ func Example() {
 		log.Fatalf("fail to write file; %s", err)
 	}
 
-	err = scp.NewSCP(client).SendFile(localPath, remotePath)
+	err = NewSCP(client).SendFile(localPath, remotePath)
 	if err != nil {
 		log.Fatalf("fail to send file; %s", err)
 	}

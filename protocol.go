@@ -139,14 +139,14 @@ func (s *sourceProtocol) readReply() error {
 	}
 }
 
-type sinkProtocol struct {
+type resourceProtocol struct {
 	remIn     io.WriteCloser
 	remOut    io.Reader
 	remReader *bufio.Reader
 }
 
-func newSinkProtocol(remIn io.WriteCloser, remOut io.Reader) (*sinkProtocol, error) {
-	s := &sinkProtocol{
+func newResourceProtocol(remIn io.WriteCloser, remOut io.Reader) (*resourceProtocol, error) {
+	s := &resourceProtocol{
 		remIn:     remIn,
 		remOut:    remOut,
 		remReader: bufio.NewReader(remOut),
@@ -183,7 +183,7 @@ func fromSecondsAndMicroseconds(seconds int64, microseconds int) time.Time {
 	return time.Unix(seconds, int64(microseconds)*(int64(time.Microsecond)/int64(time.Nanosecond)))
 }
 
-func (s *sinkProtocol) ReadHeaderOrReply() (interface{}, error) {
+func (s *resourceProtocol) ReadHeaderOrReply() (interface{}, error) {
 	b, err := s.remReader.ReadByte()
 	if err == io.EOF {
 		return nil, err
@@ -284,7 +284,7 @@ func (s *sinkProtocol) ReadHeaderOrReply() (interface{}, error) {
 	}
 }
 
-func (s *sinkProtocol) CopyFileBodyTo(h fileMsgHeader, w io.Writer) error {
+func (s *resourceProtocol) CopyFileBodyTo(h fileMsgHeader, w io.Writer) error {
 	lr := io.LimitReader(s.remReader, h.Size)
 	n, err := io.Copy(w, lr)
 	if err == io.EOF {
@@ -303,7 +303,7 @@ func (s *sinkProtocol) CopyFileBodyTo(h fileMsgHeader, w io.Writer) error {
 	return nil
 }
 
-func (s *sinkProtocol) WriteReplyOK() error {
+func (s *resourceProtocol) WriteReplyOK() error {
 	_, err := s.remIn.Write([]byte{replyOK})
 	return err
 }
