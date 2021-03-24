@@ -12,6 +12,25 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+var (
+	emptySourceObserver = EmptySourceObserver{}
+)
+
+type SourceObserver interface {
+	OnFileInfo(fileInfo *FileInfo)
+
+	OnWrite(p []byte)
+}
+
+type EmptySourceObserver struct {
+}
+
+func (e EmptySourceObserver) OnFileInfo(fileInfo *FileInfo) {
+}
+
+func (e EmptySourceObserver) OnWrite(p []byte) {
+}
+
 // Receive copies a single remote file to the specified writer
 // and returns the file information. The actual type of the file information is
 // scp.FileInfo, and you can get the access time with fileInfo.(*scp.FileInfo).AccessTime().
@@ -19,13 +38,13 @@ func (s *SCP) Receive(srcFile string, dest io.Writer) (os.FileInfo, error) {
 	var info os.FileInfo
 	srcFile = realPath(filepath.Clean(srcFile))
 	err := runResourceSession(s.ctx, s.client, srcFile, false, "", false, true, func(s *resourceSession) error {
-		var timeHeader timeMsgHeader
+		var timeHeader TimeMsgHeader
 		h, err := s.ReadHeaderOrReply()
 		if err != nil {
 			return fmt.Errorf("failed to read scp message header: err=%s", err)
 		}
 		var ok bool
-		timeHeader, ok = h.(timeMsgHeader)
+		timeHeader, ok = h.(TimeMsgHeader)
 		if !ok {
 			return fmt.Errorf("expected time message header, got %+v", h)
 		}
@@ -34,7 +53,7 @@ func (s *SCP) Receive(srcFile string, dest io.Writer) (os.FileInfo, error) {
 		if err != nil {
 			return fmt.Errorf("failed to read scp message header: err=%s", err)
 		}
-		fileHeader, ok := h.(fileMsgHeader)
+		fileHeader, ok := h.(FileMsgHeader)
 		if !ok {
 			return fmt.Errorf("expected file message header, got %+v", h)
 		}
@@ -62,36 +81,55 @@ func (s *SCP) ReceiveFile(srcFile, destFile string) error {
 		destFile = filepath.Join(destFile, filepath.Base(srcFile))
 	}
 
-	return runResourceSession(s.ctx, s.client, srcFile, false, "", false, true, func(s *resourceSession) error {
-		h, err := s.ReadHeaderOrReply()
+	return runResourceSession(s.ctx, s.client, srcFile, false, "", false, true, func(rs *resourceSession) error {
+		h, err := rs.ReadHeaderOrReply()
 		if err != nil {
 			return fmt.Errorf("failed to read scp message header: err=%s", err)
 		}
-		timeHeader, ok := h.(timeMsgHeader)
+		timeHeader, ok := h.(TimeMsgHeader)
 		if !ok {
 			return fmt.Errorf("expected time message header, got %+v", h)
 		}
 
-		h, err = s.ReadHeaderOrReply()
+		h, err = rs.ReadHeaderOrReply()
 		if err != nil {
 			return fmt.Errorf("failed to read scp message header: err=%s", err)
 		}
-		fileHeader, ok := h.(fileMsgHeader)
+		fileHeader, ok := h.(FileMsgHeader)
 		if !ok {
 			return fmt.Errorf("expected file message header, got %+v", h)
 		}
 
-		return copyFileBodyFromRemote(s, destFile, timeHeader, fileHeader)
+		return s.copyFileBodyFromRemote(rs, destFile, timeHeader, fileHeader)
 	})
 }
 
-func copyFileBodyFromRemote(s *resourceSession, localFilename string, timeHeader timeMsgHeader, fileHeader fileMsgHeader) error {
+type writerProxy struct {
+	writer io.Writer
+	onWriterFunc func(p []byte)
+}
+
+func (w *writerProxy) Write(p []byte) (n int, err error) {
+	w.onWriterFunc(p)
+	n, err = w.writer.Write(p)
+	return
+}
+
+func(s *SCP) copyFileBodyFromRemote(rs *resourceSession, localFilename string, timeHeader TimeMsgHeader, fileHeader FileMsgHeader) error {
+	fileInfo := NewFileInfo(localFilename, fileHeader.Size, fileHeader.Mode, timeHeader.Mtime, timeHeader.Atime)
+	s.sourceObserver.OnFileInfo(fileInfo)
+
 	file, err := os.OpenFile(localFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, fileHeader.Mode)
 	if err != nil {
 		return fmt.Errorf("failed to open destination file: err=%s", err)
 	}
 
-	if err := s.CopyFileBodyTo(fileHeader, file); err != nil {
+	wo := &writerProxy{
+		writer:       file,
+		onWriterFunc: s.sourceObserver.OnWrite,
+	}
+
+	if err := rs.CopyFileBodyTo(fileHeader, wo); err != nil {
 		file.Close()
 		return fmt.Errorf("failed to copy file: err=%s", err)
 	}
@@ -132,24 +170,24 @@ func (s *SCP) ReceiveDir(srcDir, destDir string, acceptFn AcceptFunc) error {
 		acceptFn = acceptAny
 	}
 
-	return runResourceSession(s.ctx, s.client, srcDir, false, "", true, true, func(s *resourceSession) error {
+	return runResourceSession(s.ctx, s.client, srcDir, false, "", true, true, func(rs *resourceSession) error {
 		curDir := destDir
-		var timeHeader timeMsgHeader
-		var timeHeaders []timeMsgHeader
+		var timeHeader TimeMsgHeader
+		var timeHeaders []TimeMsgHeader
 		isFirstStartDirectory := true
 		var skipBaseDir string
 		for {
-			h, err := s.ReadHeaderOrReply()
+			h, err := rs.ReadHeaderOrReply()
 			if err == io.EOF {
 				break
 			} else if err != nil {
 				return fmt.Errorf("failed to read scp message header: err=%s", err)
 			}
 			switch h.(type) {
-			case timeMsgHeader:
-				timeHeader = h.(timeMsgHeader)
-			case startDirectoryMsgHeader:
-				dirHeader := h.(startDirectoryMsgHeader)
+			case TimeMsgHeader:
+				timeHeader = h.(TimeMsgHeader)
+			case StartDirectoryMsgHeader:
+				dirHeader := h.(StartDirectoryMsgHeader)
 
 				if isFirstStartDirectory {
 					isFirstStartDirectory = false
@@ -182,7 +220,7 @@ func (s *SCP) ReceiveDir(srcDir, destDir string, acceptFn AcceptFunc) error {
 				if err := os.Chmod(curDir, dirHeader.Mode); err != nil {
 					return fmt.Errorf("failed to change directory mode: err=%s", err)
 				}
-			case endDirectoryMsgHeader:
+			case EndDirectoryMsgHeader:
 				if len(timeHeaders) > 0 {
 					timeHeader = timeHeaders[len(timeHeaders)-1]
 					timeHeaders = timeHeaders[:len(timeHeaders)-1]
@@ -208,8 +246,8 @@ func (s *SCP) ReceiveDir(srcDir, destDir string, acceptFn AcceptFunc) error {
 						skipBaseDir = ""
 					}
 				}
-			case fileMsgHeader:
-				fileHeader := h.(fileMsgHeader)
+			case FileMsgHeader:
+				fileHeader := h.(FileMsgHeader)
 				if skipBaseDir == "" {
 					info := NewFileInfo(fileHeader.Name, fileHeader.Size, fileHeader.Mode, timeHeader.Mtime, timeHeader.Atime)
 					accepted, err := acceptFn(curDir, info)
@@ -220,11 +258,11 @@ func (s *SCP) ReceiveDir(srcDir, destDir string, acceptFn AcceptFunc) error {
 						continue
 					}
 					localFilename := filepath.Join(curDir, fileHeader.Name)
-					if err = copyFileBodyFromRemote(s, localFilename, timeHeader, fileHeader); err != nil {
+					if err = s.copyFileBodyFromRemote(rs, localFilename, timeHeader, fileHeader); err != nil {
 						return err
 					}
 				} else {
-					if err := s.CopyFileBodyTo(fileHeader, ioutil.Discard); err != nil {
+					if err := rs.CopyFileBodyTo(fileHeader, ioutil.Discard); err != nil {
 						return err
 					}
 				}

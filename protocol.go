@@ -159,19 +159,19 @@ func newResourceProtocol(remIn io.WriteCloser, remOut io.Reader) (*resourceProto
 	return s, nil
 }
 
-type timeMsgHeader struct {
+type TimeMsgHeader struct {
 	Mtime time.Time
 	Atime time.Time
 }
 
-type startDirectoryMsgHeader struct {
+type StartDirectoryMsgHeader struct {
 	Mode os.FileMode
 	Name string
 }
 
-type endDirectoryMsgHeader struct{}
+type EndDirectoryMsgHeader struct{}
 
-type fileMsgHeader struct {
+type FileMsgHeader struct {
 	Mode os.FileMode
 	Size int64
 	Name string
@@ -192,7 +192,7 @@ func (s *resourceProtocol) ReadHeaderOrReply() (interface{}, error) {
 	}
 	switch b {
 	case msgCopyFile:
-		var h fileMsgHeader
+		var h FileMsgHeader
 		n, err := fmt.Fscanf(s.remReader, "%04o %d %s\n", &h.Mode, &h.Size, &h.Name)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read scp file message header: err=%s", err)
@@ -208,7 +208,7 @@ func (s *resourceProtocol) ReadHeaderOrReply() (interface{}, error) {
 
 		return h, nil
 	case msgStartDirectory:
-		var h startDirectoryMsgHeader
+		var h StartDirectoryMsgHeader
 		var dummySize int64
 		n, err := fmt.Fscanf(s.remReader, "%04o %d %s\n", &h.Mode, &dummySize, &h.Name)
 		if err != nil {
@@ -235,7 +235,7 @@ func (s *resourceProtocol) ReadHeaderOrReply() (interface{}, error) {
 			return nil, fmt.Errorf("failed to write scp replyOK reply: err=%s", err)
 		}
 
-		return endDirectoryMsgHeader{}, nil
+		return EndDirectoryMsgHeader{}, nil
 	case msgTime:
 		var ms int64
 		var mus int
@@ -254,7 +254,7 @@ func (s *resourceProtocol) ReadHeaderOrReply() (interface{}, error) {
 			return nil, fmt.Errorf("failed to write scp replyOK reply: err=%s", err)
 		}
 
-		h := timeMsgHeader{
+		h := TimeMsgHeader{
 			Mtime: fromSecondsAndMicroseconds(ms, mus),
 			Atime: fromSecondsAndMicroseconds(as, aus),
 		}
@@ -284,7 +284,7 @@ func (s *resourceProtocol) ReadHeaderOrReply() (interface{}, error) {
 	}
 }
 
-func (s *resourceProtocol) CopyFileBodyTo(h fileMsgHeader, w io.Writer) error {
+func (s *resourceProtocol) CopyFileBodyTo(h FileMsgHeader, w io.Writer) error {
 	lr := io.LimitReader(s.remReader, h.Size)
 	n, err := io.Copy(w, lr)
 	if err == io.EOF {
